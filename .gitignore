@@ -1,0 +1,8 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+.positai
+
+raw_data/
+app_backup_working.R
