@@ -8,6 +8,7 @@ library(bslib)
 # Load cleaned data
 sample_info <- read.csv("clean_data/sample_info.csv")
 
+
 counts <- read.csv(
   "clean_data/normalized_counts.csv",
   check.names = FALSE,
@@ -25,6 +26,11 @@ gene_lookup <- de %>%
 gene_choices <- setNames(
   gene_lookup$gene_id,
   paste0(gene_lookup$symbol, " | ", gene_lookup$gene_id)
+)
+
+condition_colors <- c(
+  "Control" = "#7B8FA1",
+  "HD" = "#8E5EA2"
 )
 
 ui <- fluidPage(
@@ -50,13 +56,16 @@ ui <- fluidPage(
     
     tabPanel("Counts Explorer",
              h3("Counts Matrix Explorer"),
+             p("Explore normalized gene counts and filter genes based on variability and detection across samples."),
+             p(em("Higher variance genes are more informative for PCA and heatmaps. The non-zero filter removes genes with little or no expression across samples.")),
              
              sidebarLayout(
                sidebarPanel(
-                 sliderInput("variance_percentile", "Minimum variance percentile:",
+                 sliderInput("variance_percentile", "Minimum gene variance percentile:",
                              min = 0, max = 100, value = 50),
-                 sliderInput("nonzero_min", "Minimum number of non-zero samples:",
+                 sliderInput("nonzero_min", "Minimum samples with detectable expression:",
                              min = 0, max = ncol(counts) - 1, value = 5),
+                 h4("Filtering Summary"),
                  verbatimTextOutput("counts_summary")
                ),
                
@@ -77,6 +86,8 @@ ui <- fluidPage(
     
     tabPanel("Differential Expression",
              h3("Differential Expression Results"),
+             p("Explore genes that differ between Huntington's Disease and Control samples."),
+             p(em("log2 fold change shows the direction and size of expression change. Adjusted p-value controls for multiple testing.")),
              
              sidebarLayout(
                sidebarPanel(
@@ -86,7 +97,9 @@ ui <- fluidPage(
                mainPanel(
                  tabsetPanel(
                    tabPanel("Table", DTOutput("de_table")),
-                   tabPanel("Volcano Plot", plotOutput("volcano_plot", height = "500px"))
+                   tabPanel("Volcano Plot",
+                            p("Each point represents one gene. The vertical dashed lines mark log2 fold change cutoffs of -1 and 1, and the horizontal dashed line marks adjusted p-value = 0.05."),
+                            plotOutput("volcano_plot", height = "500px"))
                  )
                )
              )
@@ -94,7 +107,8 @@ ui <- fluidPage(
     
     tabPanel("Gene Expression",
              h3("Individual Gene Expression"),
-             p("Select a gene and view its normalized expression across sample groups."),
+             p("Search for a gene symbol or Ensembl gene ID to compare normalized expression between HD and Control samples."),
+             p(em("Example genes: HTT, BDNF, GFAP, MBP, SNAP25")),
              
              selectizeInput("selected_gene", "Choose gene:",
                             choices = NULL,
@@ -105,8 +119,7 @@ ui <- fluidPage(
                             )
              ),
              
-             selectInput("group_var", "Group by:",
-                         choices = c("condition")),
+             p(strong("Grouped by:"), "Condition (HD vs Control)"),
              
              plotOutput("gene_boxplot", height = "500px")
     )
@@ -132,9 +145,14 @@ server <- function(input, output, session) {
   })
   
   output$condition_plot <- renderPlot({
-    ggplot(sample_info, aes(x = condition)) +
+    ggplot(sample_info, aes(x = condition, fill = condition)) +
       geom_bar() +
+      scale_fill_manual(values = condition_colors) +
       theme_minimal(base_size = 14) +
+      theme(
+        plot.title = element_text(face = "bold"),
+        legend.position = "none"
+      ) +
       labs(
         title = "Sample Distribution by Condition",
         x = "Condition",
@@ -190,7 +208,7 @@ server <- function(input, output, session) {
         title = "Mean Count vs Variance",
         x = "Mean normalized count",
         y = "Variance",
-        color = "Pass filter"
+        color = "Included after filter"
       )
   })
   
@@ -210,13 +228,17 @@ server <- function(input, output, session) {
         title = "Mean Count vs Non-Zero Samples",
         x = "Mean normalized count",
         y = "Number of non-zero samples",
-        color = "Pass filter"
+        color = "Included after filter"
       )
   })
   
   output$pca_plot <- renderPlot({
     filtered <- filtered_gene_stats() %>%
       filter(pass_filter)
+    
+    validate(
+      need(nrow(filtered) >= 2, "Move the filters lower to include at least 2 genes for PCA.")
+    )
     
     filtered_counts <- counts %>%
       filter(gene_id %in% filtered$gene_id)
@@ -236,10 +258,7 @@ server <- function(input, output, session) {
     
     ggplot(pca_df, aes(x = PC1, y = PC2, color = condition)) +
       geom_point(size = 3) +
-      scale_color_manual(values = c(
-        "Control" = "#7B8FA1",
-        "HD" = "#8E5EA2"
-      )) +
+      scale_color_manual(values = condition_colors) +
       theme_minimal(base_size = 14) +
       theme(
         plot.title = element_text(face = "bold")
@@ -290,7 +309,13 @@ server <- function(input, output, session) {
   })
   
   output$de_table <- renderDT({
-    datatable(filtered_de())
+    results <- filtered_de()
+    
+    validate(
+      need(nrow(results) > 0, "No genes matched your search. Try a different gene symbol or Ensembl ID.")
+    )
+    
+    datatable(results)
   })
   
   output$volcano_plot <- renderPlot({
@@ -309,6 +334,7 @@ server <- function(input, output, session) {
       ) +
       labs(
         title = "Volcano Plot of Differential Expression",
+        subtitle = "Dashed lines show |log2 fold change| ≥ 1 and adjusted p-value < 0.05 thresholds",
         x = "log2 Fold Change",
         y = "-log10 adjusted p-value",
         color = "Significant"
@@ -317,7 +343,9 @@ server <- function(input, output, session) {
   
   # Gene expression tab
   output$gene_boxplot <- renderPlot({
-    req(input$selected_gene)
+    validate(
+      need(input$selected_gene != "", "Please select a gene to view its expression.")
+    )
     
     selected_counts <- counts %>%
       filter(gene_id == input$selected_gene) %>%
@@ -328,17 +356,32 @@ server <- function(input, output, session) {
       ) %>%
       left_join(sample_info, by = "sample_id")
     
+    validate(
+      need(nrow(selected_counts) > 0, "Gene not found in the normalized counts matrix."),
+      need(any(!is.na(selected_counts$expression)), "No expression values were found for this gene.")
+    )
+    
     gene_label <- gene_lookup %>%
       filter(gene_id == input$selected_gene) %>%
       pull(symbol)
     
-    ggplot(selected_counts,
-           aes_string(x = input$group_var, y = "expression")) +
-      geom_boxplot() +
-      geom_jitter(width = 0.2, alpha = 0.6) +
+    if (length(gene_label) == 0 || is.na(gene_label) || gene_label == "") {
+      gene_label <- input$selected_gene
+    }
+    
+    ggplot(selected_counts, aes(x = condition, y = expression, fill = condition)) +
+      geom_violin(alpha = 0.4, trim = TRUE) +
+      geom_boxplot(width = 0.15, outlier.shape = NA, alpha = 0.8) +
+      geom_jitter(width = 0.15, alpha = 0.6, size = 2) +
+      scale_fill_manual(values = condition_colors) +
       theme_minimal(base_size = 14) +
+      theme(
+        plot.title = element_text(face = "bold"),
+        legend.position = "none"
+      ) +
       labs(
-        title = paste("Normalized Expression of", gene_label, "(", input$selected_gene, ")"),
+        title = paste0("Normalized Expression of ", gene_label),
+        subtitle = input$selected_gene,
         x = "Condition",
         y = "Normalized expression"
       )
